@@ -1,0 +1,68 @@
+# Builds the scanner on GitHub's own Windows machine from the tagged commit, then
+# publishes the zip with its SHA-256 and a signed build-provenance attestation, so
+# anyone can check that a download was made from this repository's code:
+#   gh attestation verify SEAM-Price-Scanner-<version>.zip --repo Nozzexx/seam-price-scanner
+#
+# Release: bump VERSION in seam_scanner.py, packaging/version-info.txt and build-exe.bat,
+# commit, then: git tag v1.3.0 && git push origin v1.3.0
+
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write       # create the release
+  id-token: write       # sign the attestation
+  attestations: write   # store the attestation
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Check the tag matches the app version
+        shell: pwsh
+        run: |
+          $v = (Select-String -Path seam_scanner.py -Pattern '^VERSION = "(.+)"').Matches[0].Groups[1].Value
+          if ("v$v" -ne "${{ github.ref_name }}") { throw "Tag ${{ github.ref_name }} does not match VERSION $v" }
+          "VERSION=$v" | Out-File -Append $env:GITHUB_ENV
+
+      - name: Install exact dependencies
+        shell: pwsh
+        run: |
+          python -m venv .venv
+          .venv\Scripts\python -m pip install --upgrade pip
+          .venv\Scripts\python -m pip install -r requirements.txt
+
+      - name: Build
+        shell: cmd
+        run: build-exe.bat
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/SEAM-Price-Scanner-${{ env.VERSION }}.zip
+
+      - name: Publish the release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $zip = "dist/SEAM-Price-Scanner-$env:VERSION.zip"
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash
+          $notes = @"
+          Built by GitHub Actions from commit ${{ github.sha }} ([build log](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})).
+
+          **SHA-256:** ``$hash``
+
+          Check it: ``Get-FileHash .\SEAM-Price-Scanner-$env:VERSION.zip -Algorithm SHA256``
+          Prove where it was built: ``gh attestation verify .\SEAM-Price-Scanner-$env:VERSION.zip --repo ${{ github.repository }}``
+          "@
+          gh release create "${{ github.ref_name }}" $zip "$zip.sha256" --title "S.E.A.M. Price Scanner $env:VERSION" --notes $notes
