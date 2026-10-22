@@ -47,7 +47,7 @@ comes with a signed record proving which commit it was built from (see
 | Start-up | Requests for the commodity list and the terminal list | Public data, no sign-in |
 | Sign in | Your S.E.A.M. email and password | Supabase Auth; you get a token back |
 | Each scan | Terminal, Buy or Sell, and for each commodity: name, price, stock and stock level | `submit_price_scan`, under your account |
-| Each scan | The screenshot of the game window, as a JPEG (at most 1920 px wide) | Private storage, readable only by you and S.E.A.M. admins |
+| Each scan | The screenshot of the game window, as a JPEG (at most 1920 px wide) | Private storage, readable only by you and S.E.A.M. admins; deleted after 30 days |
 | Undo, Move, Recent scans | Your own scan's ID | `withdraw_price_scan`, `move_price_scan`, `my_price_scans` |
 
 What the screenshot can contain: whatever the game shows at that moment, including your
