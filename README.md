@@ -146,5 +146,11 @@ waiting to be sent while offline). Delete the folder to remove everything.
 
 See [SECURITY.md](SECURITY.md).
 
+## License
+
+[MIT](LICENSE): free to read, use, change and share, with credit. The Geo font in
+`assets/` keeps its own SIL Open Font License, and the test screenshots show Star
+Citizen, which belongs to Cloud Imperium Games.
+
 Star Citizen is a trademark of Cloud Imperium Games. This is a fan-made tool and is not
 affiliated with or endorsed by Cloud Imperium Games.
