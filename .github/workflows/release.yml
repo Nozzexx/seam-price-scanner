@@ -1,10 +1,11 @@
 # Builds the scanner on GitHub's own Windows machine from the tagged commit, then
-# publishes the zip with its SHA-256 and a signed build-provenance attestation, so
-# anyone can check that a download was made from this repository's code:
-#   gh attestation verify SEAM-Price-Scanner-<version>.zip --repo Nozzexx/seam-price-scanner
+# publishes the installer and the portable zip, each with its SHA-256 and a signed
+# build-provenance attestation, so anyone can check a download was made from
+# this repository's code:
+#   gh attestation verify SEAM-Price-Scanner-Setup.exe --repo Nozzexx/seam-price-scanner
 #
-# Release: bump VERSION in seam_scanner.py, packaging/version-info.txt and build-exe.bat,
-# commit, then: git tag v1.3.0 && git push origin v1.3.0
+# Release: bump VERSION in seam_scanner.py and packaging/version-info.txt, commit,
+# then: git tag v1.3.1 && git push origin v1.3.1
 
 name: Release
 
@@ -41,28 +42,46 @@ jobs:
           .venv\Scripts\python -m pip install --upgrade pip
           .venv\Scripts\python -m pip install -r requirements.txt
 
+      - name: Install Inno Setup (makes the installer)
+        shell: pwsh
+        run: |
+          choco install innosetup --no-progress -y
+          "ISCC_PATH=${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" | Out-File -Append $env:GITHUB_ENV
+
       - name: Build
         shell: cmd
         run: build-exe.bat
 
+      - name: Check both downloads were built
+        shell: pwsh
+        run: |
+          foreach ($f in "dist/SEAM-Price-Scanner-Setup.exe", "dist/SEAM-Price-Scanner-$env:VERSION.zip") { if (-not (Test-Path $f)) { throw "missing $f" } }
+
       - name: Attest build provenance
         uses: actions/attest-build-provenance@v2
         with:
-          subject-path: dist/SEAM-Price-Scanner-${{ env.VERSION }}.zip
+          subject-path: |
+            dist/SEAM-Price-Scanner-Setup.exe
+            dist/SEAM-Price-Scanner-${{ env.VERSION }}.zip
 
       - name: Publish the release
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          $setup = "dist/SEAM-Price-Scanner-Setup.exe"
           $zip = "dist/SEAM-Price-Scanner-$env:VERSION.zip"
-          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash
+          $hs = (Get-FileHash $setup -Algorithm SHA256).Hash
+          $hz = (Get-FileHash $zip -Algorithm SHA256).Hash
           $notes = @"
           Built by GitHub Actions from commit ${{ github.sha }} ([build log](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})).
 
-          **SHA-256:** ``$hash``
+          | Download | SHA-256 |
+          | --- | --- |
+          | **SEAM-Price-Scanner-Setup.exe** (installer, recommended) | ``$hs`` |
+          | SEAM-Price-Scanner-$env:VERSION.zip (portable, no install) | ``$hz`` |
 
-          Check it: ``Get-FileHash .\SEAM-Price-Scanner-$env:VERSION.zip -Algorithm SHA256``
-          Prove where it was built: ``gh attestation verify .\SEAM-Price-Scanner-$env:VERSION.zip --repo ${{ github.repository }}``
+          Check a download: ``Get-FileHash .\SEAM-Price-Scanner-Setup.exe -Algorithm SHA256``
+          Prove where it was built: ``gh attestation verify .\SEAM-Price-Scanner-Setup.exe --repo ${{ github.repository }}``
           "@
-          gh release create "${{ github.ref_name }}" $zip "$zip.sha256" --title "S.E.A.M. Price Scanner $env:VERSION" --notes $notes
+          gh release create "${{ github.ref_name }}" $setup "$setup.sha256" $zip "$zip.sha256" --title "S.E.A.M. Price Scanner $env:VERSION" --notes $notes

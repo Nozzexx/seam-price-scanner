@@ -73,9 +73,15 @@ copy of this app might send:
 
 ## Install
 
-Download `SEAM-Price-Scanner-<version>.zip` from [Releases](../../releases), unzip it
-anywhere and run `SEAM Price Scanner.exe`. Then press **Sign in** with your S.E.A.M. email
-and password. (Signed up with Discord? Set a password with "Forgot password" on the site.)
+Download **`SEAM-Price-Scanner-Setup.exe`** from [Releases](../../releases/latest) and run
+it. It installs for your Windows account only (no administrator prompt) into
+`%LOCALAPPDATA%\Programs\SEAM Price Scanner`, adds a Start menu entry, and appears in
+Settings > Apps, where you can uninstall it like any other program. Running a newer
+setup upgrades it in place. Then press **Sign in** with your S.E.A.M. email and
+password. (Signed up with Discord? Set a password with "Forgot password" on the site.)
+
+Rather not install anything? Each release also has a portable
+`SEAM-Price-Scanner-<version>.zip`: unzip it anywhere and run `SEAM Price Scanner.exe`.
 
 Windows may say "Windows protected your PC" the first time, because the app is new and
 not yet code-signed. Choose **More info**, then **Run anyway**, after checking the
@@ -83,17 +89,17 @@ download as below if you like.
 
 ## Checking a download
 
-Each release lists the zip's SHA-256. In PowerShell:
+Each release lists the SHA-256 of both downloads. In PowerShell:
 
 ```powershell
-Get-FileHash .\SEAM-Price-Scanner-1.3.0.zip -Algorithm SHA256
+Get-FileHash .\SEAM-Price-Scanner-Setup.exe -Algorithm SHA256
 ```
 
-The result must match the release page. To prove the zip was built by GitHub from this
+The result must match the release page. To prove the file was built by GitHub from this
 repository (and not swapped afterwards), with the [GitHub CLI](https://cli.github.com):
 
 ```powershell
-gh attestation verify .\SEAM-Price-Scanner-1.3.0.zip --repo Nozzexx/seam-price-scanner
+gh attestation verify .\SEAM-Price-Scanner-Setup.exe --repo Nozzexx/seam-price-scanner
 ```
 
 It prints the exact commit and workflow run that produced the file.
@@ -105,7 +111,7 @@ double-click `run-scanner.bat`. The first run creates a private Python environme
 `.venv` and installs the exact versions in [`requirements.txt`](requirements.txt).
 `run-scanner.bat --console` starts a text-only version.
 
-To build the .exe yourself: `build-exe.bat`.
+To build it yourself: `build-exe.bat` (the installer also needs [Inno Setup 6](https://jrsoftware.org/isinfo.php)).
 
 ## Settings
 
@@ -120,7 +126,7 @@ To build the .exe yourself: `build-exe.bat`.
 
 The same folder holds `last-scan.png` (the most recent capture, never uploaded unless it
 was sent with a scan), `scans.log` (what was sent and the result) and `queue\` (scans
-waiting to be sent while offline). Delete the folder to remove everything.
+waiting to be sent while offline). Uninstalling keeps this folder (so a reinstall keeps your sign-in); delete it to remove everything.
 
 ## Using it
 
@@ -137,7 +143,7 @@ waiting to be sent while offline). Delete the folder to remove everything.
 | `seam_scanner.py` | Everything that matters: capture, OCR, matching, the server calls, hotkeys |
 | `seam_scanner_gui.py` | The window (tkinter) |
 | `requirements.txt` | Exact versions of the four libraries used: `mss` (screenshots), `Pillow` (images), `winrt-*` (Windows OCR) |
-| `build-exe.bat`, `packaging/` | How the .exe is built (PyInstaller) |
+| `build-exe.bat`, `packaging/` | How the app is built (PyInstaller) and the installer (Inno Setup, `packaging/installer.iss`) |
 | `.github/workflows/release.yml` | The GitHub build that makes each release |
 | `test/` | Real terminal screenshots for testing, with the wallet balance and character name blacked out |
 | `assets/` | Icon, logo and the Geo font (SIL Open Font License) |

@@ -45,7 +45,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 # The live S.E.A.M. site. The publishable key is public by design (the website ships it
 # to every visitor); what a signed-in user may do is enforced by the database.
 DEFAULT_SITE_URL = "https://ptumimzylfskitbnlfmf.supabase.co"
