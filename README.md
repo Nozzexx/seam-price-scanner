@@ -22,11 +22,15 @@ comes with a signed record proving which commit it was built from (see
 3. **Reads it on your PC.** Text recognition is done by the OCR engine built into Windows
    (`Windows.Media.Ocr`). Nothing is sent anywhere at this point.
 4. **Matches names to S.E.A.M.'s commodity list.** A price that is not read cleanly is
-   skipped, never guessed. Shop kiosks (Pharmacy, armour and so on) are recognised and
-   nothing is sent.
+   never sent on a guess: it is listed as *Unclear* with the scanner's best reading, and
+   **Check price** next to the result lets you confirm it or type the right one. Shop
+   kiosks (Pharmacy, armour and so on) are recognised and nothing is sent. A commodity
+   S.E.A.M. does not know yet is named in the results instead of silently left out.
 5. **Sends the prices to your S.E.A.M. account**, together with the screenshot as evidence
    for moderators. If the game window was not found, no screenshot is sent. You can turn
-   screenshots off entirely (see [Settings](#settings)).
+   screenshots off entirely (see [Settings](#settings)). Each commodity is sent once per
+   terminal and tab every 90 seconds, however many screenshots show it; repeats are listed
+   as *Already sent*.
 
 ## What it never does
 
@@ -48,6 +52,7 @@ comes with a signed record proving which commit it was built from (see
 | Sign in | Your S.E.A.M. email and password | Supabase Auth; you get a token back |
 | Each scan | Terminal, Buy or Sell, and for each commodity: name, price, stock and stock level | `submit_price_scan`, under your account |
 | Each scan | The screenshot of the game window, as a JPEG (at most 1920 px wide) | Private storage, readable only by you and S.E.A.M. admins; deleted after 30 days |
+| Check price | One commodity's price, as you confirmed or corrected it, with that scan's screenshot | `submit_price_scan`, under your account |
 | Undo, Move, Recent scans | Your own scan's ID | `withdraw_price_scan`, `move_price_scan`, `my_price_scans` |
 
 What the screenshot can contain: whatever the game shows at that moment, including your
@@ -68,6 +73,8 @@ copy of this app might send:
   everyone else's wait for an officer.
 - At most 40 scans an hour, 80 prices per scan, and the same commodity at the same
   terminal three times in ten minutes.
+- The same commodity, terminal and tab from the scanner is filed once per 90 seconds
+  (`scanner_repeat_seconds`); later copies come back as duplicates.
 - Screenshots go to a folder named after your account, which only you and admins can
   read.
 
@@ -123,6 +130,7 @@ To build it yourself: `build-exe.bat` (the installer also needs [Inno Setup 6](h
 | `hotkey_buy`, `hotkey_sell` | `ctrl+shift+f9`, `ctrl+shift+f10` | The two hotkeys |
 | `min_match` | `0.84` | How closely a name must match a commodity |
 | `terminal` | | The terminal used when its name is not on screen |
+| `repeat_seconds` | `90` | A commodity already sent from this terminal and tab within this many seconds is not sent again |
 
 The same folder holds `last-scan.png` (the most recent capture, never uploaded unless it
 was sent with a scan), `scans.log` (what was sent and the result) and `queue\` (scans
@@ -133,7 +141,9 @@ waiting to be sent while offline). Uninstalling keeps this folder (so a reinstal
 1. Open a commodity terminal in game and pick the Buy or Sell tab.
 2. Press the matching hotkey. One beep means it started; a rising two-tone beep means the
    prices were sent; a falling tone means something went wrong (the window says what).
-3. Wrong terminal or tab? **Undo** withdraws the scan, and **Move to terminal...** files it
+3. A price marked *Unclear*? Click **Check price** next to it, compare with the terminal,
+   and confirm or correct it. (In the console version: `confirm <name> [price]`.)
+4. Wrong terminal or tab? **Undo** withdraws the scan, and **Move to terminal...** files it
    at the right one, for 24 hours.
 
 ## Files

@@ -45,7 +45,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.3.1"
+VERSION = "1.4.0"
 # The live S.E.A.M. site. The publishable key is public by design (the website ships it
 # to every visitor); what a signed-in user may do is enforced by the database.
 DEFAULT_SITE_URL = "https://ptumimzylfskitbnlfmf.supabase.co"
@@ -147,6 +147,9 @@ def load_config() -> dict:
     cfg.setdefault("hotkey_buy", "ctrl+shift+f9")
     cfg.setdefault("hotkey_sell", "ctrl+shift+f10")
     cfg.setdefault("min_match", 0.84)
+    # The same commodity on the same terminal tab is sent once in this many seconds, however
+    # many screenshots show it (S.E.A.M. enforces its own limit on top).
+    cfg.setdefault("repeat_seconds", 90)
     return cfg
 
 
@@ -499,16 +502,17 @@ def _trusted_unit_price(text: str) -> int | None:
     return v if glyph or re.search(r"uec", text[m.start(1):m.end()], re.I) else None
 
 
-def read_unit_price(seg, img) -> tuple[int | None, bool]:
-    """(price, looked_like_a_price). Reads the segment; when the currency glyph is missing,
-    digits next to it were probably lost, so the spot is re-read with small variations
+def read_unit_price(seg, img) -> tuple[int | None, bool, int | None]:
+    """(price, looked_like_a_price, best_guess). Reads the segment; when the currency glyph is
+    missing, digits next to it were probably lost, so the spot is re-read with small variations
     (OCR on tiny crops is jittery: one pixel can turn '¤1,142' into '142'). A price is
-    accepted only when two trusted re-reads agree; otherwise nothing is sent."""
+    accepted only when two trusted re-reads agree; otherwise nothing is sent and best_guess
+    (the most common re-read, else the raw read) is offered to the player to confirm or fix."""
     if not UNIT_PRICE_RE.search(seg.text):
-        return None, False
+        return None, False, None
     v = _trusted_unit_price(seg.text)
     if v is not None or img is None:
-        return v, True
+        return v, True, v if v is not None else unit_price_in(seg.text)
     base = (seg.x - seg.h * 5, seg.y - seg.h * 0.6, seg.x_end + seg.h, seg.y + seg.h * 1.6)
     blue = img.split()[2].convert("RGB") if img.mode == "RGB" else img
     votes: dict[int, int] = {}
@@ -523,8 +527,9 @@ def read_unit_price(seg, img) -> tuple[int | None, bool]:
                 if r is not None:
                     votes[r] = votes.get(r, 0) + 1
                     if votes[r] >= 2:
-                        return r, True
-    return None, True
+                        return r, True, r
+    guess = max(votes, key=votes.get) if votes else unit_price_in(seg.text)
+    return None, True, guess
 
 
 def stock_in(text: str) -> float | None:
@@ -614,8 +619,21 @@ class Match:
 
 
 @dataclass
+class Unclear:
+    """A known commodity whose price could not be read with confidence: never sent on its
+    own, but shown to the player with the best guess so they can confirm or correct it."""
+    slug: str
+    name: str
+    guess: int | None
+    raw: str
+    stock: float | None = None
+    inventory: str | None = None
+
+
+@dataclass
 class ParseResult:
     matches: list[Match] = field(default_factory=list)
+    unclear: list[Unclear] = field(default_factory=list)
     unmatched_rows: list[str] = field(default_factory=list)
     terminal_hint: str | None = None
     detected_mode: str | None = None   # 'buy' | 'sell' from the highlighted tab, when visible
@@ -721,20 +739,24 @@ def prices_in(tokens: list[str]) -> tuple[int | None, float | None]:
 
 def detect_tab(img, words: list[Word]) -> str | None:
     """The selected BUY/SELL tab is drawn as a filled, bright box; the other is an outline.
-    Compare the brightness around the two tab labels near the top of the screen."""
+    Compare the brightness around the two tab labels near the top of the screen. Newer
+    terminals call the sell tab LOCAL MARKET VALUE; its middle word stands in for SELL."""
     if img is None:
         return None
     from PIL import ImageStat
     top = img.height * 0.35
-    tabs = {}
-    for w in words:
-        t = w.text.strip().upper()
-        if t in ("BUY", "SELL") and w.y < top and t not in tabs:
-            pad_x, pad_y = w.w * 0.6, w.h * 0.5
-            box = (int(max(0, w.x - pad_x)), int(max(0, w.y - pad_y)), int(min(img.width, w.x + w.w + pad_x)), int(min(img.height, w.y + w.h + pad_y)))
-            tabs[t] = ImageStat.Stat(img.crop(box).convert("L")).mean[0]
-    if len(tabs) < 2:
+    buys = [w for w in words if w.text.strip().upper() == "BUY" and w.y < top]
+    sells = [w for w in words if w.text.strip().upper() in ("SELL", "MARKET") and w.y < top]
+    # The two tabs sit side by side; a 'SELL' elsewhere (a CANNOT SELL filter) is not a tab.
+    pair = min(((abs(b.cy - s.cy), b, s) for b in buys for s in sells if abs(b.cy - s.cy) < max(b.h, s.h)),
+               key=lambda p: p[0], default=None)
+    if pair is None:
         return None
+    tabs = {}
+    for t, w in (("BUY", pair[1]), ("SELL", pair[2])):
+        pad_x, pad_y = w.w * 0.6, w.h * 0.5
+        box = (int(max(0, w.x - pad_x)), int(max(0, w.y - pad_y)), int(min(img.width, w.x + w.w + pad_x)), int(min(img.height, w.y + w.h + pad_y)))
+        tabs[t] = ImageStat.Stat(img.crop(box).convert("L")).mean[0]
     buy, sell = tabs["BUY"], tabs["SELL"]
     if abs(buy - sell) < 18:  # too close to call
         return None
@@ -744,7 +766,26 @@ def detect_tab(img, words: list[Word]) -> str | None:
 LABEL_RE = re.compile(r"\binventory\b|\bquantity\b|out of stock|^\W*(very\s+)?(low|high)\W*$|^\W*(medium|max|full)\W*$", re.I)
 
 
-def parse_screen(words: list[Word], commodities: list[dict], terminals: list[dict], min_score: float, img=None) -> ParseResult:
+def terminal_on_screen(full_text: str, terminals: list[dict], current: str | None) -> str | None:
+    """A terminal or location name shown on screen. Cities and stations can have several
+    terminals (Lorville: Admin Office and Trade Center), so a location name alone only
+    counts when it is unambiguous, or when it agrees with the terminal already picked."""
+    for t in terminals:
+        label = t.get("terminal_name")
+        if label and len(norm(label)) >= 5 and norm(label) in full_text:
+            return t["terminal_slug"]
+    for t in terminals:
+        label = t.get("location_name")
+        if label and len(norm(label)) >= 5 and norm(label) in full_text:
+            here = [x["terminal_slug"] for x in terminals if x.get("location_name") == label]
+            if len(here) == 1:
+                return here[0]
+            return current if current in here else None
+    return None
+
+
+def parse_screen(words: list[Word], commodities: list[dict], terminals: list[dict], min_score: float, img=None,
+                 current_terminal: str | None = None) -> ParseResult:
     names = {norm(c["name"]): (c["slug"], c["name"]) for c in commodities}
     res = ParseResult()
     full_text = norm(" ".join(w.text for w in words))
@@ -758,13 +799,7 @@ def parse_screen(words: list[Word], commodities: list[dict], terminals: list[dic
     res.detected_mode = detect_tab(img, words)
     res.is_item_shop = "quickbuy" in full_text and not res.is_commodity_terminal
 
-    for t in terminals:
-        for label in (t.get("location_name"), t.get("terminal_name")):
-            if label and len(norm(label)) >= 5 and norm(label) in full_text:
-                res.terminal_hint = t["terminal_slug"]
-                break
-        if res.terminal_hint:
-            break
+    res.terminal_hint = terminal_on_screen(full_text, terminals, current_terminal)
 
     segs = sorted(segments(words), key=lambda s: (s.cy, s.x))
     named: list[tuple[Segment, float, tuple[str, str], int]] = []
@@ -791,21 +826,32 @@ def parse_screen(words: list[Word], commodities: list[dict], terminals: list[dic
         # 0. commodity terminal (4.x): the price is a '<glyph>N/SCU' line at the far right of the
         #    item card, just below the stock line; the inventory label sits under the name.
         nxt_cy = min((n[0].cy for n in named if n[0] is not seg and n[0].cy > seg.cy + seg.h * 0.8 and abs(n[0].x - seg.x) < seg.h * 6), default=float("inf"))
-        band = sorted((b for b in segs if b is not seg and b.x >= seg.x_end - 2
+        # A long name can run straight into the stock figure ('COMPOSITE0 SCU'), so the card's
+        # right-hand column starts where the name ends, not where its segment ends; and the
+        # right-aligned price below may start left of that, under the end of the name.
+        name_end = seg.words[used - 1].x + seg.words[used - 1].w if 0 < used <= len(seg.words) else seg.x_end
+        band = sorted((b for b in segs if b is not seg
+                       and (b.x >= name_end - 2 or (b.x_end > name_end + seg.h and b.x > seg.x + seg.h * 3))
                        and seg.cy - seg.h * 1.6 <= b.cy < min(nxt_cy - seg.h * 0.4, seg.cy + seg.h * 4.5)), key=lambda b: (b.cy, b.x))
         under = [b for b in segs if b is not seg and 0 < b.cy - seg.cy <= seg.h * 2.2 and seg.x - seg.h * 4 <= b.x < seg.x_end + seg.h * 4]
         band_text = " ".join(b.text for b in band)
+        tail = " ".join(seg.tokens[used:])
+        if used and re.match(SCU, tail, re.I) and re.search(r"[0oO]$", seg.tokens[used - 1]):
+            tail = "0 " + tail  # the stock's '0' was read as the last letter of the name
         price_seg = next((b for b in band if "/" in b.text and UNIT_PRICE_RE.search(b.text)), None)
         uprice = None
         if price_seg is not None:
             used_price_segs.add(id(price_seg))
-            uprice, _ = read_unit_price(price_seg, img)
+            uprice, _, guess = read_unit_price(price_seg, img)
             if uprice is None:
-                res.unmatched_rows.append(f"{name}: price unclear ('{price_seg.text}'), not sent")
+                if slug not in seen:
+                    ustock = stock_in(tail + " " + " ".join(b.text for b in band if b is not price_seg))
+                    inv = inventory_in(" ".join([seg.text] + [b.text for b in under])) or ("out_of_stock" if ustock == 0 else None)
+                    res.unclear.append(Unclear(slug, name, guess, price_seg.text, ustock, inv))
                 seen.add(slug)
                 continue
         if uprice is not None:
-            ustock = stock_in(" ".join(b.text for b in band if b is not price_seg))
+            ustock = stock_in(tail + " " + " ".join(b.text for b in band if b is not price_seg))
             inv = inventory_in(" ".join([seg.text] + [b.text for b in under])) or inventory_in(band_text)
             if inv is None and ustock == 0:
                 inv = "out_of_stock"
@@ -854,7 +900,7 @@ def parse_screen(words: list[Word], commodities: list[dict], terminals: list[dic
         for ps in segs:
             if id(ps) in used_price_segs or "/" not in ps.text or ps.x <= col_x:
                 continue
-            uprice, looked = read_unit_price(ps, img)
+            uprice, looked, guess = read_unit_price(ps, img)
             if not looked:
                 continue
             box = (int(max(0, col_x - ps.h * 6)), int(max(0, ps.cy - ps.h * 5.5)), int(ps.x), int(min(img.height, ps.cy + ps.h)))
@@ -862,17 +908,27 @@ def parse_screen(words: list[Word], commodities: list[dict], terminals: list[dic
                 continue
             card = ocr(img.crop(box), 3.0)
             card_segs = sorted(segments(card), key=lambda c: c.cy)
+            known = False
             for cs in card_segs:
                 cscore, chit, _ = best_name(cs.tokens, names, min_score)
+                if chit:
+                    known = True
                 if chit and chit[0] not in seen:
                     seen.add(chit[0])
-                    if uprice is None:
-                        res.unmatched_rows.append(f"{chit[1]}: price unclear ('{ps.text}'), not sent")
-                        break
                     band_text = " ".join(b.text for b in segs if b.x >= ps.x - ps.h and ps.cy - ps.h * 4.5 <= b.cy <= ps.cy + ps.h * 0.5)
                     inv = inventory_in(" ".join(c.text for c in card_segs))
+                    if uprice is None:
+                        res.unclear.append(Unclear(chit[0], chit[1], guess, ps.text, stock_in(band_text), inv))
+                        break
                     res.matches.append(Match(chit[0], chit[1], uprice, round(cscore, 2), stock_in(band_text), inv, cs.text + " (card re-read)"))
                     break
+            if not known:
+                # A priced card whose name is not on S.E.A.M.'s list (a commodity added in a patch):
+                # say so, instead of dropping it without a word.
+                label = next((cs.text for cs in card_segs if sum(ch.isalpha() for ch in cs.text) >= 4 and "/" not in cs.text
+                              and not LABEL_RE.search(cs.text) and not re.search(r"cargo|scu|stock", cs.text, re.I)), None)
+                if label:
+                    res.unmatched_rows.append(f"{label.strip().title()}: not on S.E.A.M.'s commodity list yet, not sent")
     return res
 
 # --------------------------------------------------------------------------
@@ -888,6 +944,10 @@ class Scanner:
         self.terminals: list[dict] = []
         self.lock = threading.Lock()
         self.listener = None  # callable(kind: str, data: dict), set by the window
+        self.sent_at: dict[tuple[str, str, str], float] = {}  # (terminal, mode, commodity) -> when it was last sent
+        # The last scan, kept so an unclear price can be confirmed afterwards with the same
+        # terminal, tab and screenshot: {"terminal", "mode", "jpeg", "shot", "unclear"}.
+        self.last_ctx: dict | None = None
 
     def _emit(self, kind: str, **data) -> None:
         if self.listener:
@@ -930,6 +990,25 @@ class Scanner:
             for t in hits[:12]:
                 say(f"   {t['terminal_slug']:<28} {t['terminal_name']} ({t['location_name']})")
 
+    def split_repeats(self, terminal: str, mode: str, items: list[dict]) -> tuple[list[dict], list[dict]]:
+        """(items to send, results for items sent a moment ago). A terminal's prices show in
+        every screenshot taken there; each one is sent once per repeat_seconds."""
+        window = float(self.cfg.get("repeat_seconds", 90))
+        now = time.time()
+        fresh, repeats = [], []
+        for it in items:
+            ago = now - self.sent_at.get((terminal, mode, it["commodity"]), -1e9)
+            if ago < window:
+                repeats.append({"commodity": it["commodity"], "status": "duplicate", "error": f"already sent {ago:.0f}s ago"})
+            else:
+                fresh.append(it)
+        return fresh, repeats
+
+    def _mark_sent(self, terminal: str, mode: str, slugs) -> None:
+        now = time.time()
+        for slug in slugs:
+            self.sent_at[(terminal, mode, slug)] = now
+
     def scan(self, mode: str, image=None, source_label: str = "") -> None:
         if not self.lock.acquire(blocking=False):
             say("Still working on the previous scan.")
@@ -945,7 +1024,7 @@ class Scanner:
                 img, why = image, source_label
                 say(f"{mode.upper()} scan of {source_label}.")
             words = ocr(img)
-            parsed = parse_screen(words, self.commodities, self.terminals, float(self.cfg["min_match"]), img)
+            parsed = parse_screen(words, self.commodities, self.terminals, float(self.cfg["min_match"]), img, self.cfg.get("terminal"))
             if parsed.detected_mode and parsed.detected_mode != mode:
                 say(f"The {parsed.detected_mode.upper()} tab is selected on screen, so these are {parsed.detected_mode} prices (you pressed {mode.upper()}).")
                 mode = parsed.detected_mode
@@ -957,40 +1036,58 @@ class Scanner:
                 self._emit("done", status="shop", message=f"{parsed.kiosk or 'Shop'} kiosk: shop items are not tracked. Nothing sent.")
                 return
             terminal = parsed.terminal_hint or self.cfg.get("terminal")
+            unclear = [{"slug": u.slug, "name": u.name, "guess": u.guess, "raw": u.raw, "stock": u.stock, "inventory": u.inventory} for u in parsed.unclear]
             self._emit("read", mode=mode, terminal=parsed.terminal_hint or self.cfg.get("terminal"),
                        matches=[{"slug": m.slug, "name": m.name, "price": m.price, "stock": m.stock, "inventory": m.inventory} for m in parsed.matches],
-                       skipped=list(parsed.unmatched_rows), seconds=round(time.time() - t0, 1))
+                       unclear=unclear, skipped=list(parsed.unmatched_rows), seconds=round(time.time() - t0, 1))
             say(f"Read {len(words)} words in {time.time() - t0:.1f}s; matched {len(parsed.matches)} prices. Terminal: {self.terminal_label(terminal)}{' (recognised on screen)' if parsed.terminal_hint else ''}.")
             for m in parsed.matches:
                 extra = (f"  stock {m.stock:g}" if m.stock is not None else "") + (f"  {m.inventory}" if m.inventory else "")
                 say(f"   {m.name:<28} {m.price:>12,} aUEC   match {m.score:.2f}{extra}")
+            for u in parsed.unclear:
+                guess = f"best guess {u.guess:,}" if u.guess is not None else "no guess"
+                say(f"   (check) {u.name}: price unclear ('{u.raw}', {guess}), not sent. Confirm or correct it (type: confirm).")
             for u in parsed.unmatched_rows[:6]:
                 say(f"   (skipped) {u}")
             APP_DIR.mkdir(parents=True, exist_ok=True)
             img.save(APP_DIR / "last-scan.png")
-            if not parsed.matches:
+            if not parsed.matches and not parsed.unclear:
                 beep("fail")
                 say("Nothing to send. Is a commodity terminal open on the game's monitor? The capture was saved as last-scan.png.")
                 self._emit("done", status="nothing", message="No prices found. Is a commodity terminal open on the game's monitor?")
                 return
+            # The screenshot goes with the scan so moderators can check it, unless the game
+            # window was not found (then it could be anything on your screen) or you
+            # turned it off ("upload_screenshot": false in config.json).
+            jpeg = to_jpeg(img) if is_game and self.cfg.get("upload_screenshot", True) else None
+            self.last_ctx = {"terminal": terminal, "mode": mode, "jpeg": jpeg, "shot": None, "unclear": unclear}
             if not terminal:
                 beep("fail")
                 say("Which terminal is this? Type: terminal <name>   then scan again. (Nothing sent.)")
                 self._emit("done", status="no_terminal", message="Pick the terminal you are at, then scan again. Nothing sent.")
                 return
+            if not parsed.matches:
+                beep("partial")
+                n = len(parsed.unclear)
+                self._emit("done", status="unclear", message=f"{n} price{'s' if n != 1 else ''} could not be read clearly. Check {'them' if n != 1 else 'it'} in the table to send.")
+                return
             items = [{"commodity": m.slug, "price": m.price, **({"stock": m.stock} if m.stock is not None else {}), **({"inventory": m.inventory} if m.inventory else {})} for m in parsed.matches]
-            # The screenshot goes with the scan so moderators can check it, unless the game
-            # window was not found (then it could be anything on your screen) or you
-            # turned it off ("upload_screenshot": false in config.json).
-            jpeg = to_jpeg(img) if is_game and self.cfg.get("upload_screenshot", True) else None
+            items, repeats = self.split_repeats(terminal, mode, items)
+            if repeats:
+                say(f"{len(repeats)} price{'s' if len(repeats) != 1 else ''} already sent from this terminal in the last {self.cfg.get('repeat_seconds', 90)}s; not sent again.")
+            if not items:
+                beep("ok")
+                self._emit("done", status="duplicate", results=repeats, message="Already sent these prices a moment ago. Nothing new to send.")
+                return
             if jpeg is None:
                 say("No screenshot attached: " + ("the Star Citizen window was not found." if not is_game else "screenshot upload is turned off in your settings."))
             if self.dry_run:
                 say(f"Dry run: would send {len(items)} {mode} prices for {terminal}.")
-                self._emit("done", status="dry", message=f"Test only: {len(items)} {mode} prices read, nothing sent.")
+                self._mark_sent(terminal, mode, (it["commodity"] for it in items))
+                self._emit("done", status="dry", results=repeats, message=f"Test only: {len(items)} {mode} prices read, nothing sent.")
                 beep("ok")
                 return
-            self.send(terminal, mode, items, jpeg)
+            self.send(terminal, mode, items, jpeg, repeats=repeats)
         except Exception as e:  # never let one scan kill the hotkeys
             beep("fail")
             say(f"Scan failed: {e}")
@@ -998,10 +1095,13 @@ class Scanner:
         finally:
             self.lock.release()
 
-    def send(self, terminal: str, mode: str, items: list[dict], jpeg: bytes | None, queued_file: Path | None = None) -> bool:
+    def send(self, terminal: str, mode: str, items: list[dict], jpeg: bytes | None, queued_file: Path | None = None,
+             repeats: list[dict] | None = None) -> bool:
         t0 = time.time()
         try:
             shot = self.site.upload_screenshot(jpeg) if jpeg else None
+            if self.last_ctx is not None and jpeg is not None and self.last_ctx.get("jpeg") is jpeg:
+                self.last_ctx["shot"] = shot  # confirmed prices from this scan reuse it
             r = self.site.submit_scan(terminal, mode, items, shot)
         except SiteError as e:
             if queued_file is None:
@@ -1010,26 +1110,63 @@ class Scanner:
                 (QUEUE_DIR / f"{stem}.json").write_text(json.dumps({"terminal": terminal, "mode": mode, "items": items}), encoding="utf-8")
                 if jpeg:
                     (QUEUE_DIR / f"{stem}.jpg").write_bytes(jpeg)
+                self._mark_sent(terminal, mode, (it["commodity"] for it in items))  # queued counts as sent
                 say(f"Could not send ({e}). Queued; it will be retried (or type: retry).")
                 self._emit("done", status="queued", message=f"Could not send ({e}). Saved; it will be sent automatically.")
             else:
                 say(f"Retry failed ({e}).")
             beep("fail")
             return False
+        results = (repeats or []) + r.get("results", [])
         ok, pend, fail = r.get("accepted", 0), r.get("pending", 0), r.get("failed", 0)
-        say(f"Sent in {time.time() - t0:.1f}s: {ok} accepted, {pend} awaiting review, {fail} refused.")
+        dup = r.get("duplicate", 0) + len(repeats or [])
+        self._mark_sent(terminal, mode, (x["commodity"] for x in r.get("results", []) if x.get("status") != "failed"))
+        say(f"Sent in {time.time() - t0:.1f}s: {ok} accepted, {pend} awaiting review, {fail} refused" + (f", {dup} already sent a moment ago." if dup else "."))
         for x in r.get("results", []):
             if x.get("status") == "failed":
                 say(f"   refused {x['commodity']}: {x.get('error')}")
             elif x.get("flags"):
                 say(f"   {x['commodity']}: held for review ({', '.join(x['flags'])})")
-        log_line({"at": datetime.now().isoformat(), "terminal": terminal, "mode": mode, "items": len(items), "accepted": ok, "pending": pend, "failed": fail})
-        self._emit("done", status="sent" if fail == 0 else "partial", accepted=ok, pending=pend, failed=fail,
+        log_line({"at": datetime.now().isoformat(), "terminal": terminal, "mode": mode, "items": len(items), "accepted": ok, "pending": pend, "failed": fail, "duplicate": dup})
+        status = "duplicate" if ok + pend + fail == 0 else "sent" if fail == 0 else "partial"
+        self._emit("done", status=status, accepted=ok, pending=pend, failed=fail,
                    scan_id=r.get("scan_id"), terminal=terminal,
-                   results=r.get("results", []), retried=queued_file is not None,
-                   message=f"Sent: {ok} accepted, {pend} awaiting review, {fail} refused.")
+                   results=results, retried=queued_file is not None,
+                   message=f"Sent: {ok} accepted, {pend} awaiting review, {fail} refused" + (f", {dup} already sent." if dup else "."))
         beep("ok" if fail == 0 else "partial")
         return True
+
+    def confirm_price(self, slug: str, price: int) -> dict:
+        """Send one price from the last scan that the player checked by eye (and corrected if
+        needed): same terminal, tab and screenshot as the scan. Raises SiteError on failure."""
+        ctx = self.last_ctx
+        u = next((x for x in (ctx or {}).get("unclear", []) if x["slug"] == slug), None)
+        if u is None:
+            raise SiteError("that price is not from the last scan; scan again")
+        terminal = ctx["terminal"] or self.cfg.get("terminal")
+        if not terminal:
+            raise SiteError("pick the terminal you are at first")
+        if not 0 < int(price) <= 10_000_000:
+            raise SiteError("enter a price between 1 and 10,000,000 aUEC")
+        item = {"commodity": slug, "price": int(price), **({"stock": u["stock"]} if u["stock"] is not None else {}),
+                **({"inventory": u["inventory"]} if u["inventory"] else {})}
+        with self.lock:
+            if self.dry_run:
+                say(f"Dry run: would send {u['name']} at {int(price):,} aUEC ({ctx['mode']}) for {terminal}.")
+                result = {"commodity": slug, "status": "dry"}
+            else:
+                if ctx.get("shot") is None and ctx.get("jpeg"):
+                    ctx["shot"] = self.site.upload_screenshot(ctx["jpeg"])
+                r = self.site.submit_scan(terminal, ctx["mode"], [item], ctx.get("shot"))
+                result = (r.get("results") or [{"commodity": slug, "status": "failed", "error": "no answer"}])[0]
+                if result.get("status") != "failed":
+                    self._mark_sent(terminal, ctx["mode"], [slug])
+                log_line({"at": datetime.now().isoformat(), "terminal": terminal, "mode": ctx["mode"], "items": 1, "confirmed": slug,
+                          "guess": u["guess"], "price": int(price)})
+                say(f"Confirmed {u['name']} at {int(price):,} aUEC: {result.get('status')}" + (f" ({result['error']})" if result.get("error") else "."))
+        if result.get("status") != "failed":
+            ctx["unclear"] = [x for x in ctx["unclear"] if x["slug"] != slug]
+        return result
 
     def retry_queue(self) -> None:
         if not QUEUE_DIR.is_dir():
@@ -1100,6 +1237,7 @@ HELP = """Commands:
   terminals [filter]    list commodity terminals
   scan buy|sell         scan now without the hotkey
   test <image> buy|sell read a saved screenshot (sends unless started with --dry-run)
+  confirm [name [price]] list the last scan's unclear prices, or send one as read (or corrected)
   retry                 resend queued scans
   status                show sign-in, terminal and hotkeys
   quit"""
@@ -1211,6 +1349,19 @@ def interactive(scanner: Scanner, cfg: dict) -> None:
                 path, _, mode = arg.rpartition(" ")
                 from PIL import Image
                 scanner.scan(mode or "sell", Image.open(path.strip('"')).convert("RGB"), path)
+            elif word == "confirm":
+                pending = (scanner.last_ctx or {}).get("unclear", [])
+                m = re.match(r"^(.*?)\s*([\d.,]+)?$", arg.strip())
+                name, price = (m.group(1), m.group(2)) if m else ("", None)
+                hits = [u for u in pending if name and norm(name) in norm(u["name"])]
+                if not name or len(hits) != 1:
+                    for u in pending:
+                        say(f"   {u['name']}: read '{u['raw']}'" + (f", best guess {u['guess']:,}" if u["guess"] is not None else ""))
+                    say("Type: confirm <name> [price]" if pending else "No unclear prices in the last scan.")
+                elif price is None and hits[0]["guess"] is None:
+                    say(f"No guess for {hits[0]['name']}; type the price: confirm {hits[0]['name']} <price>")
+                else:
+                    scanner.confirm_price(hits[0]["slug"], (_clean_number(price) or 0) if price else hits[0]["guess"])
             elif word == "retry":
                 scanner.retry_queue()
             elif word == "status":

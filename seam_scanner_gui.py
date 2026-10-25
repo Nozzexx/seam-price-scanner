@@ -140,8 +140,8 @@ class App:
         self.root = tk.Tk()
         self.root.title("S.E.A.M. Price Scanner")
         self.root.configure(bg=BG)
-        self.root.geometry("1080x800")
-        self.root.minsize(960, 760)
+        self.root.geometry("1160x800")
+        self.root.minsize(1060, 760)
         try:
             self.root.iconbitmap(default=str(asset("seam.ico")))
         except Exception:
@@ -288,19 +288,26 @@ class App:
         self.move_btn.set_enabled(False)
         self.scan_meta = tk.Label(res, text="No scan yet", bg=PANEL, fg=MUTED, font=("Segoe UI", 9), anchor="w")
         self.scan_meta.pack(fill="x", padx=14, pady=(0, 6))
-        cols = ("commodity", "price", "stock", "inventory", "result")
+        cols = ("commodity", "price", "stock", "inventory", "result", "action")
         wrap = tk.Frame(res, bg=PANEL)
         wrap.pack(fill="both", expand=True, padx=1, pady=(0, 1))
         self.table = ttk.Treeview(wrap, columns=cols, show="headings", selectmode="browse")
-        for c, label, width, anchor in (("commodity", "COMMODITY", 220, "w"), ("price", "PRICE  aUEC / SCU", 140, "e"),
-                                        ("stock", "STOCK  SCU", 110, "e"), ("inventory", "INVENTORY", 110, "w"),
-                                        ("result", "RESULT", 190, "w")):
+        for c, label, width, anchor in (("commodity", "COMMODITY", 165, "w"), ("price", "PRICE  aUEC / SCU", 125, "e"),
+                                        ("stock", "STOCK  SCU", 85, "e"), ("inventory", "INVENTORY", 100, "w"),
+                                        ("result", "RESULT", 160, "w"), ("action", "", 105, "center")):
             self.table.heading(c, text=label, anchor=anchor)
-            self.table.column(c, width=width, anchor=anchor, stretch=c in ("commodity", "result"))
+            self.table.column(c, width=width, minwidth=width if c == "action" else 20, anchor=anchor,
+                              stretch=c in ("commodity", "result"))
         self.table.tag_configure("accepted", foreground=TEXT)
         self.table.tag_configure("pending", foreground=AMBER)
         self.table.tag_configure("refused", foreground=RED)
         self.table.tag_configure("skipped", foreground=MUTED)
+        self.table.tag_configure("unclear", foreground=AMBER)
+        # Prices the scanner could not read with confidence: click "Check price" to confirm or fix one.
+        self.unclear_rows: dict[str, dict] = {}
+        self.table.bind("<ButtonRelease-1>", self._table_click)
+        self.table.bind("<Double-1>", lambda e: self._check_price(self.table.identify_row(e.y)))
+        self.table.bind("<Motion>", self._table_hover)
         sb = ttk.Scrollbar(wrap, orient="vertical", command=self.table.yview)
         self.table.configure(yscrollcommand=sb.set)
         self.table.pack(side="left", fill="both", expand=True)
@@ -497,14 +504,22 @@ class App:
     def _show_read(self, data: dict) -> None:
         self.table.delete(*self.table.get_children())
         self.last_rows.clear()
+        self.unclear_rows.clear()
         for m in data["matches"]:
             stock = "" if m["stock"] is None else f"{m['stock']:,.0f}"
             inv = (m["inventory"] or "").replace("_", " ").title()
-            iid = self.table.insert("", "end", values=(m["name"], f"{m['price']:,}", stock, inv, "Read"))
+            iid = self.table.insert("", "end", values=(m["name"], f"{m['price']:,}", stock, inv, "Read", ""))
             self.last_rows[m["slug"]] = iid
+        for u in data.get("unclear", []):
+            stock = "" if u["stock"] is None else f"{u['stock']:,.0f}"
+            inv = (u["inventory"] or "").replace("_", " ").title()
+            guess = f"{u['guess']:,} ?" if u["guess"] is not None else "?"
+            iid = self.table.insert("", "end", values=(u["name"], guess, stock, inv, "?  Unclear, not sent", "✎ Check price"),
+                                    tags=("unclear",))
+            self.unclear_rows[iid] = u
         for s in data["skipped"]:
             name, _, why = s.partition(":")
-            self.table.insert("", "end", values=(name, "", "", "", "–  Skipped: " + why.strip()[:60]), tags=("skipped",))
+            self.table.insert("", "end", values=(name, "", "", "", "–  Skipped: " + why.strip()[:60], ""), tags=("skipped",))
         tt = next((t for t in self.scanner.terminals if t["terminal_slug"] == data.get("terminal")), None)
         term = terminal_text(tt) if tt else "no terminal picked"
         self.scan_meta.configure(text=f"{data['mode'].upper()} tab  ·  {term}  ·  {data['seconds']}s")
@@ -522,7 +537,7 @@ class App:
             self.last_scan = None
             self.undo_btn.set_enabled(False)
             self.move_btn.set_enabled(False)
-        colour = {"sent": GREEN, "partial": AMBER, "queued": AMBER, "dry": ACCENT}.get(status, RED)
+        colour = {"sent": GREEN, "partial": AMBER, "queued": AMBER, "dry": ACCENT, "duplicate": ACCENT, "unclear": AMBER}.get(status, RED)
         self._banner(data.get("message", ""), colour)
         for r in data.get("results", []):
             iid = self.last_rows.get(r.get("commodity"))
@@ -530,7 +545,9 @@ class App:
                 continue
             vals = list(self.table.item(iid, "values"))
             st = r.get("status")
-            if st == "failed":
+            if st == "duplicate":
+                vals[4], tag = "↺  " + str(r.get("error", "already sent")).capitalize(), "skipped"
+            elif st == "failed":
                 vals[4], tag = "✕  Refused: " + str(r.get("error", ""))[:40], "refused"
             elif st == "pending" or r.get("flags"):
                 vals[4], tag = "◷  Awaiting review", "pending"
@@ -542,6 +559,82 @@ class App:
                 vals = list(self.table.item(iid, "values"))
                 vals[4] = "Saved, sending later"
                 self.table.item(iid, values=vals, tags=("pending",))
+
+    # ---- unclear prices ----
+    def _table_click(self, e) -> None:
+        iid = self.table.identify_row(e.y)
+        if iid in self.unclear_rows and self.table.identify_column(e.x) == "#6":
+            self._check_price(iid)
+
+    def _table_hover(self, e) -> None:
+        iid = self.table.identify_row(e.y)
+        on = iid in self.unclear_rows and self.table.identify_column(e.x) == "#6"
+        self.table.configure(cursor="hand2" if on else "")
+
+    def _check_price(self, iid: str) -> None:
+        u = self.unclear_rows.get(iid)
+        if not u:
+            return
+        guess_text = f"{u['guess']:,}" if u["guess"] is not None else ""
+        d = self._dialog("Check this price")
+        f = tk.Frame(d, bg=PANEL)
+        f.pack(padx=28, pady=24)
+        tk.Label(f, text=f"Check: {u['name']}", bg=PANEL, fg=TEXT, font=("Segoe UI Semibold", 14)).pack(anchor="w")
+        tk.Label(f, text="The scanner was not sure it read this price correctly, so it was not sent.\n"
+                         "Compare it with the terminal, then confirm it or type the right price.",
+                 bg=PANEL, fg=MUTED, font=("Segoe UI", 9), justify="left").pack(anchor="w", pady=(4, 10))
+        tk.Label(f, text=f"Read on screen:  {u['raw']}", bg=PANEL, fg=MUTED, font=("Consolas", 9)).pack(anchor="w", pady=(0, 10))
+        tk.Label(f, text="Price  aUEC / SCU", bg=PANEL, fg=MUTED, font=("Segoe UI", 9)).pack(anchor="w")
+        var = tk.StringVar(value=guess_text)
+        entry = tk.Entry(f, textvariable=var, bg=RAISED, fg=TEXT, insertbackground=TEXT, relief="flat", font=("Segoe UI", 12),
+                         width=20, highlightthickness=1, highlightbackground=BORDER, highlightcolor=ACCENT, justify="right")
+        entry.pack(anchor="w", ipady=6, pady=(2, 6))
+        err = tk.Label(f, text="", bg=PANEL, fg=RED, font=("Segoe UI", 9), wraplength=360, justify="left")
+        err.pack(anchor="w")
+        row = tk.Frame(f, bg=PANEL)
+        row.pack(fill="x", pady=(10, 0))
+
+        def relabel(*_):
+            go.configure(text="Confirm price" if var.get().strip() == guess_text and guess_text else "Send corrected price")
+        var.trace_add("write", relabel)
+
+        def submit(_e=None):
+            price = core._clean_number(var.get())
+            if price is None:
+                err.configure(text="Type the price in aUEC per SCU, for example 1,142.", fg=RED)
+                return
+            go.set_enabled(False)
+            err.configure(text="Sending...", fg=MUTED)
+
+            def done(result):
+                st = result.get("status")
+                if st == "failed":
+                    err.configure(text=f"Refused: {result.get('error', '')}", fg=RED)
+                    go.set_enabled(True)
+                    return
+                label = {"accepted": "✓  Accepted (checked)", "pending": "◷  Awaiting review (checked)",
+                         "duplicate": "↺  Already sent", "dry": "Test only (checked)"}.get(st, str(st))
+                vals = list(self.table.item(iid, "values"))
+                vals[1], vals[4], vals[5] = f"{price:,}", label, ""
+                self.table.item(iid, values=vals, tags=("pending",) if st == "pending" else ("accepted",))
+                self.unclear_rows.pop(iid, None)
+                self._banner(f"{u['name']} sent at {price:,} aUEC.", GREEN)
+                d.destroy()
+
+            def failed(msg):
+                err.configure(text=msg, fg=RED)
+                go.set_enabled(True)
+            self._bg(lambda: self.scanner.confirm_price(u["slug"], price), done, failed)
+
+        go = FlatButton(row, "Confirm price", submit, kind="primary")
+        go.pack(side="left")
+        FlatButton(row, "Cancel", d.destroy).pack(side="left", padx=(8, 0))
+        relabel()
+        d.bind("<Return>", submit)
+        d.bind("<Escape>", lambda e: d.destroy())
+        entry.focus_set()
+        entry.select_range(0, "end")
+        d.grab_set()
 
     # ---- dialogs ----
     def _dialog(self, title: str, width: int = 420) -> tk.Toplevel:
@@ -624,7 +717,8 @@ class App:
                         "game, not the rest of your screen). It only listens for its two hotkeys, never other keys."),
             ("Read", "Windows' built-in text recognition reads the terminal on your PC. Nothing leaves your PC yet."),
             ("Match", "Names are matched to S.E.A.M.'s commodity list. A price that is not read cleanly is "
-                      "skipped, never guessed."),
+                      "never sent on a guess: it is marked for you to check, then confirm or correct. "
+                      "Each price is sent once a minute or so, however many screenshots show it."),
             ("Send", "The prices and the screenshot (as evidence for moderators; only you and S.E.A.M. admins can "
                      "see it) go to your S.E.A.M. account. If the game window is not found, no screenshot is sent."),
         ]
