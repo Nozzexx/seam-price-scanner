@@ -4,8 +4,9 @@
 # this repository's code:
 #   gh attestation verify SEAM-Price-Scanner-Setup.exe --repo Nozzexx/seam-price-scanner
 #
-# Release: bump VERSION in seam_scanner.py and packaging/version-info.txt, commit,
-# then: git tag v1.3.1 && git push origin v1.3.1
+# Release: bump VERSION in seam_scanner.py and packaging/version-info.txt, add a
+# '## <version> (<date>)' section to CHANGELOG.md, commit, then:
+#   git tag v1.4.1; git push origin v1.4.1
 
 name: Release
 
@@ -34,6 +35,15 @@ jobs:
           $v = (Select-String -Path seam_scanner.py -Pattern '^VERSION = "(.+)"').Matches[0].Groups[1].Value
           if ("v$v" -ne "${{ github.ref_name }}") { throw "Tag ${{ github.ref_name }} does not match VERSION $v" }
           "VERSION=$v" | Out-File -Append $env:GITHUB_ENV
+
+      - name: Take this version's notes from CHANGELOG.md
+        shell: pwsh
+        run: |
+          # The section from '## <version>' up to the next '## ' heading. The site's download
+          # page reads the same file, so the notes are written once.
+          $m = [regex]::Match((Get-Content CHANGELOG.md -Raw), "(?ms)^## $([regex]::Escape($env:VERSION))\b[^\n]*\n(.*?)(?=^## |\z)")
+          if (-not $m.Success -or -not $m.Groups[1].Value.Trim()) { throw "CHANGELOG.md has no '## $env:VERSION' section" }
+          $m.Groups[1].Value.Trim() | Out-File -Encoding utf8 changes.md
 
       - name: Install exact dependencies
         shell: pwsh
@@ -73,7 +83,12 @@ jobs:
           $zip = "dist/SEAM-Price-Scanner-$env:VERSION.zip"
           $hs = (Get-FileHash $setup -Algorithm SHA256).Hash
           $hz = (Get-FileHash $zip -Algorithm SHA256).Hash
+          $changes = Get-Content changes.md -Raw
           $notes = @"
+          $changes
+
+          ---
+
           Built by GitHub Actions from commit ${{ github.sha }} ([build log](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})).
 
           | Download | SHA-256 |
